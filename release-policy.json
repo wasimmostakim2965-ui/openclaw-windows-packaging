@@ -1,0 +1,13 @@
+{
+  "repository": "https://github.com/openclaw/openclaw",
+  "channel": "stable",
+  "msixRevision": 0,
+  "packageIdentityName": "OpenClawFoundation.OpenClawGateway",
+  "packageFamilyName": "OpenClawFoundation.OpenClawGateway_rfcbke2p71se2",
+  "publisher": "CN=4BA40A7A-B719-4C40-BF91-84AF4F1136FC",
+  "sideloadPackageIdentity": {
+    "name": "OpenClaw.Gateway",
+    "familyName": "OpenClaw.Gateway_kaa03rpbbqef6",
+    "publisher": "CN=OpenClaw Foundation, O=OpenClaw Foundation, L=Mill Valley, S=California, C=US"
+  }
+}

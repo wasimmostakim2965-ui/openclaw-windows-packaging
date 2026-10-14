@@ -1,0 +1,115 @@
+using System.CommandLine;
+
+namespace OpenClaw.Launcher.Tests;
+
+// clawctl keeps System.CommandLine's completion support but deliberately
+// disables response-file expansion. These cases exist so a later "restore the
+// library defaults" change cannot silently reintroduce file reads driven by an
+// argument, or drop completion.
+public sealed class ClawCtlParserDefaultsTests : IDisposable
+{
+    private readonly string _testDirectory = TestDirectory.Create();
+
+    private static async Task<(int ExitCode, string Output)> RunAsync(
+        params string[] args)
+    {
+        using var output = new StringWriter();
+
+        int exitCode = await Program.RunControlAsync(
+            new HostOptions(null, null, []),
+            args,
+            _ => { },
+            output,
+            TextWriter.Null,
+            new FailIfWorkStartsLifecycle()).ConfigureAwait(false);
+
+        return (exitCode, output.ToString());
+    }
+
+    private string CreateResponseFile(string name, params string[] lines)
+    {
+        string path = Path.Combine(_testDirectory, name);
+        File.WriteAllLines(path, lines);
+        return path;
+    }
+
+    // A readable file holding a valid command is the case that would succeed if
+    // expansion were ever re-enabled, so it is the one worth asserting on. A
+    // missing file must fail the same way, as an argument rather than a crash.
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ResponseFileTokenIsRejectedRatherThanExpanded(bool responseFileExists)
+    {
+        string responseFile = responseFileExists
+            ? CreateResponseFile("commands.rsp", "setup")
+            : Path.Combine(_testDirectory, "absent.rsp");
+
+        (int exitCode, string output) =
+            await RunAsync($"@{responseFile}").ConfigureAwait(true);
+
+        Assert.Equal(1, exitCode);
+        Assert.DoesNotContain(
+            "package is ready",
+            output,
+            StringComparison.Ordinal);
+    }
+
+    // Completion is a parse-time query. It must never start the readiness
+    // operation, because a shell issues it on every keystroke.
+    [Fact]
+    public void CompletionSuggestsCommandsWithoutResolvingNode()
+    {
+        RootCommand root = ClawCtlCommandLine.Create(new ClawCtlHandlers
+        {
+            Setup = (_, _) => throw new InvalidOperationException(
+                "Completion started the readiness operation."),
+            Status = _ => Task.FromResult(0),
+            CollectLogs = (_, _) => Task.FromResult(0),
+            Teardown = (_, _) => Task.FromResult(0),
+            PowerShell = (_, _) => Task.FromResult(0),
+            GatewayStart = (_, _) => Task.FromResult(0),
+            GatewayStatus = _ => Task.FromResult(0),
+            GatewayStop = _ => Task.FromResult(0),
+            GatewayRestart = _ => Task.FromResult(0)
+        });
+
+        IEnumerable<string> completions = root
+            .Parse("se", ClawCtlCommandLine.CreateParserConfiguration())
+            .GetCompletions()
+            .Select(completion => completion.Label);
+
+        Assert.Contains(
+            ClawCtlCommandLine.SetupCommandName,
+            completions,
+            StringComparer.Ordinal);
+    }
+
+    // The directive is the only completion path a shell can actually reach, so
+    // it is covered through the real dispatcher rather than the in-process
+    // completion API alone.
+    [Fact]
+    public async Task CompletionDirectiveWritesSuggestionsWithoutRunningSetup()
+    {
+        (int exitCode, string output) =
+            await RunAsync("[suggest:2]", "se").ConfigureAwait(true);
+
+        Assert.Equal(0, exitCode);
+        Assert.Contains(
+            ClawCtlCommandLine.SetupCommandName,
+            output,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task CompletionDirectiveSuggestsCanonicalFlags()
+    {
+        (int exitCode, string output) =
+            await RunAsync("[suggest:3]", "--h").ConfigureAwait(true);
+
+        Assert.Equal(0, exitCode);
+        Assert.Contains("--help", output, StringComparison.Ordinal);
+    }
+
+    public void Dispose() => Directory.Delete(_testDirectory, recursive: true);
+}

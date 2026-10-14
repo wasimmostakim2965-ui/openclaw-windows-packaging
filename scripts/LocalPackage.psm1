@@ -1,0 +1,1455 @@
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$script:PackageName = 'OpenClawFoundation.OpenClawGateway'
+$script:LegacyPackageName = 'OpenClaw.Gateway'
+$script:StateSchema = 1
+$script:ControlApplicationId = 'Control'
+
+function Get-LocalPackageIdentity {
+    param([string]$Patch)
+
+    # Only an omitted -Patch selects the base identity. An explicitly empty
+    # value, such as an unset variable, must fail: falling back would let a
+    # caller who asked for a patch remove the base registration or, with
+    # -ReplaceExistingInstall, an installed release and its app data.
+    if (-not $PSBoundParameters.ContainsKey('Patch')) {
+        return [pscustomobject]@{
+            Name = $script:PackageName
+            Patch = ''
+            DisplayName = ''
+            AgentCommand = 'openclaw'
+            ControlCommand = 'clawctl'
+            StateDirectory = 'artifacts\local-package'
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($Patch)) {
+        throw (
+            '-Patch requires a name. Omit -Patch to deploy the base ' +
+            "$script:PackageName identity."
+        )
+    }
+
+    # The suffix becomes part of the package name, both execution aliases, and
+    # a state directory. Package names are limited to 50 characters, which
+    # leaves 15 after the base name and separator.
+    $normalized = $Patch.ToLowerInvariant()
+    if ($normalized.Length -gt 15 -or
+        $normalized -cnotmatch '^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$') {
+        throw (
+            "Invalid -Patch '$Patch'. Use 1 to 15 letters, digits, or " +
+            'hyphens, starting and ending with a letter or digit.'
+        )
+    }
+    return [pscustomobject]@{
+        Name = "$script:PackageName-$normalized"
+        Patch = $normalized
+        DisplayName = "OpenClaw Gateway ($normalized)"
+        AgentCommand = "openclaw-$normalized"
+        ControlCommand = "clawctl-$normalized"
+        StateDirectory = "artifacts\local-package\patches\$normalized"
+    }
+}
+
+function Invoke-LocalPackageControlCommand {
+    param(
+        [Parameter(Mandatory)][string]$PackageName,
+        [Parameter(Mandatory)][string]$PackageFamilyName,
+        [Parameter(Mandatory)][string]$Arguments
+    )
+
+    $package = Get-AppxPackage -Name $PackageName -ErrorAction Stop |
+        Where-Object { $_.PackageFamilyName -eq $PackageFamilyName } |
+        Select-Object -First 1
+    if ($null -eq $package) {
+        throw "The owning package was not registered for this user: $PackageFamilyName."
+    }
+    if ($package.Status.ToString() -notmatch '^(Ok|Ready)$') {
+        throw "The owning package is not ready: $PackageFamilyName ($($package.Status))."
+    }
+
+    $manifestPath = Join-Path $package.InstallLocation 'AppxManifest.xml'
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        throw "The owning package manifest was not found: $manifestPath."
+    }
+    [xml]$manifest = Get-Content -LiteralPath $manifestPath -Raw
+    $application = @(
+        $manifest.Package.Applications.Application |
+            Where-Object { $_.Id -eq $script:ControlApplicationId }
+    ) | Select-Object -First 1
+    if ($null -eq $application -or [string]$application.Executable -ne 'openclaw.exe') {
+        throw "The owning package does not expose the control application: $PackageFamilyName!$script:ControlApplicationId."
+    }
+
+    if (-not ('OpenClaw.PackageActivation.IApplicationActivationManager' -as [type])) {
+        $source = @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+namespace OpenClaw.PackageActivation
+{
+    [ComImport]
+    [Guid("2e941141-7f97-4756-ba1d-9decde894a3d")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IApplicationActivationManager
+    {
+        [PreserveSig]
+        int ActivateApplication(
+            [MarshalAs(UnmanagedType.LPWStr)] string appUserModelId,
+            [MarshalAs(UnmanagedType.LPWStr)] string arguments,
+            uint options,
+            out uint processId);
+    }
+
+    [ComImport]
+    [Guid("45ba127d-10a8-46ea-8ab7-56ea9078943c")]
+    public class ApplicationActivationManager
+    {
+    }
+
+    public static class ApplicationActivator
+    {
+        private const uint Synchronize = 0x00100000;
+        private const uint QueryLimitedInformation = 0x1000;
+        private const uint Infinite = 0xffffffff;
+        private const uint WaitObject0 = 0;
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(
+            uint desiredAccess,
+            bool inheritHandle,
+            uint processId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
+
+        [DllImport("kernel32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        public static int ActivateAndWait(string appUserModelId, string arguments)
+        {
+            var manager =
+                (IApplicationActivationManager)new ApplicationActivationManager();
+            int result = manager.ActivateApplication(
+                appUserModelId,
+                arguments,
+                0,
+                out uint processId);
+            if (result != 0)
+            {
+                Marshal.ThrowExceptionForHR(result);
+            }
+
+            IntPtr process = OpenProcess(
+                Synchronize | QueryLimitedInformation,
+                false,
+                processId);
+            if (process == IntPtr.Zero)
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+
+            try
+            {
+                if (WaitForSingleObject(process, Infinite) != WaitObject0 ||
+                    !GetExitCodeProcess(process, out uint exitCode))
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+
+                return checked((int)exitCode);
+            }
+            finally
+            {
+                CloseHandle(process);
+            }
+        }
+    }
+}
+'@
+        Add-Type -TypeDefinition $source -Language CSharp
+    }
+
+    $exitCode = [OpenClaw.PackageActivation.ApplicationActivator]::ActivateAndWait(
+        "$PackageFamilyName!$script:ControlApplicationId",
+        $Arguments)
+    if ($exitCode -ne 0) {
+        throw "clawctl $Arguments failed (exit $exitCode)."
+    }
+}
+
+function Read-LocalPackageRecord {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    try {
+        $record = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -AsHashtable
+    }
+    catch {
+        throw "Cannot read local state '$Path': $($_.Exception.Message)"
+    }
+    if ($record -isnot [System.Collections.IDictionary]) {
+        throw "Local state must be a JSON object: $Path"
+    }
+    return $record
+}
+
+function Write-LocalPackageRecord {
+    param([string]$Path, [System.Collections.IDictionary]$Record)
+
+    $temporary = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        [IO.File]::WriteAllText($temporary, ($Record | ConvertTo-Json -Depth 8) + "`n")
+        [IO.File]::Move($temporary, $Path, $true)
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+    }
+}
+
+function Get-LocalPackageFingerprint {
+    param([string[]]$Parts)
+
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        return [Convert]::ToHexString(
+            $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes(($Parts -join "`n")))
+        ).ToLowerInvariant()
+    }
+    finally { $sha.Dispose() }
+}
+
+function Assert-LocalPackagePayload {
+    param([string]$Directory, [string]$Architecture)
+
+    $application = Join-Path $Directory 'app'
+    if (-not (Test-Path -LiteralPath (Join-Path $application 'openclaw.mjs') -PathType Leaf)) {
+        throw "Payload is missing app\openclaw.mjs: $Directory. Supply a complete -PayloadDirectory or use -RefreshPayload."
+    }
+    $completion = Join-Path $application 'shell-completions\openclaw.ps1'
+    if (-not (Test-Path -LiteralPath $completion -PathType Leaf)) {
+        throw (
+            "Payload is missing app\shell-completions\openclaw.ps1: $Directory. " +
+            'Use -PayloadRunId with a successful workflow run from this branch, or ' +
+            'supply a matching -PayloadDirectory.'
+        )
+    }
+    $metadata = Read-LocalPackageRecord (Join-Path $Directory 'payload-metadata.json')
+    if ($null -eq $metadata -or $metadata['architecture'] -ne $Architecture -or
+        $metadata['layout'] -ne 'expanded-directory' -or
+        [string]$metadata['nodeVersion'] -notmatch '^v?\d+\.\d+\.\d+$') {
+        throw "Payload metadata must describe an expanded $Architecture directory with a Node.js version: $Directory. Supply a matching payload or use -RefreshPayload."
+    }
+    return ([string]$metadata['nodeVersion']).TrimStart('v')
+}
+
+function Get-LocalPackageCheckoutCommit {
+    param(
+        [scriptblock]$FindGit = {
+            @(Get-Command git -CommandType Application -ErrorAction SilentlyContinue) |
+                Select-Object -First 1
+        }
+    )
+
+    $git = & $FindGit
+    if ($null -eq $git) { return '' }
+    $commit = (& $git.Source -C $PSScriptRoot rev-parse HEAD 2>$null)
+    if ($LASTEXITCODE -ne 0 -or -not $commit) { return '' }
+    return $commit.Trim().ToLowerInvariant()
+}
+
+function Assert-LocalPackagePayloadIsSafe {
+    param([string]$Directory)
+
+    # The packaged layout links to this tree, so a link inside it would resolve
+    # outside the package at run time.
+    $application = Join-Path $Directory 'app'
+    foreach ($entry in Get-ChildItem -LiteralPath $application -Force -Recurse) {
+        if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw (
+                'The downloaded payload contains a link or reparse point: ' +
+                [IO.Path]::GetRelativePath($application, $entry.FullName)
+            )
+        }
+        if (-not $entry.PSIsContainer -and
+            ($entry.Name -ieq 'node.exe' -or $entry.Name -match '^node-v\d')) {
+            throw (
+                'The downloaded payload must not bundle Node.js: ' +
+                [IO.Path]::GetRelativePath($application, $entry.FullName)
+            )
+        }
+    }
+}
+
+function Get-LocalPackageGitHubCommand {
+    # More than one gh.exe can be on PATH; take the first match rather than
+    # letting .Source concatenate every candidate path.
+    $gh = @(Get-Command gh -CommandType Application -ErrorAction SilentlyContinue) |
+        Select-Object -First 1
+    if ($null -eq $gh) {
+        throw 'GitHub CLI (gh) is required to acquire a payload. Install and authenticate gh, or pass -PayloadDirectory; a completed cache needs no gh.'
+    }
+    return $gh
+}
+
+function Resolve-LocalPackagePayload {
+    param(
+        [string]$CacheDirectory,
+        [string]$Architecture,
+        [string]$PayloadDirectory,
+        [long]$PayloadRunId,
+        [switch]$RefreshPayload,
+        [hashtable]$Operations
+    )
+
+    if ($PayloadDirectory) {
+        $directory = (Resolve-Path -LiteralPath $PayloadDirectory -ErrorAction Stop).Path
+        $nodeVersion = Assert-LocalPackagePayload $directory $Architecture
+        Write-Host "Payload: supplied directly ($directory)"
+        return [pscustomobject]@{
+            Directory = $directory; NodeVersion = $nodeVersion
+            CacheHit = $true; Superseded = $null
+            PendingSelection = $null; SelectionPath = $null
+        }
+    }
+
+    New-Item -Path $CacheDirectory -ItemType Directory -Force | Out-Null
+    $selectionPath = Join-Path $CacheDirectory 'current.json'
+    $current = $null
+    try { $current = Read-LocalPackageRecord $selectionPath }
+    catch {
+        if (-not $RefreshPayload) {
+            throw "$($_.Exception.Message) Run with -RefreshPayload to replace the invalid selection."
+        }
+        Write-Warning "Replacing an unreadable cache selection: $selectionPath"
+    }
+    if ($null -ne $current) {
+        if ($current['schemaVersion'] -ne $script:StateSchema -or
+            $current['architecture'] -ne $Architecture -or
+            $current['generation'] -isnot [string] -or
+            $current['generation'] -notmatch '^[1-9]\d*-[0-9a-f]{32}$' -or
+            $current['runId'] -isnot [long] -or $current['runId'] -le 0) {
+            if (-not $RefreshPayload) {
+                throw "Invalid payload cache selection: $selectionPath. Run with -RefreshPayload to replace it."
+            }
+            Write-Warning "Replacing an invalid cache selection: $selectionPath"
+            $current = $null
+        }
+        if ($null -ne $current -and -not $RefreshPayload -and
+            ($PayloadRunId -eq 0 -or $PayloadRunId -eq $current['runId'])) {
+            $directory = Join-Path $CacheDirectory $current['generation']
+            $nodeVersion = Assert-LocalPackagePayload $directory $Architecture
+            Write-Host "Payload: cache hit, run $($current['runId'])"
+            return [pscustomobject]@{
+                Directory = $directory; NodeVersion = $nodeVersion
+                CacheHit = $true; Superseded = $null
+                PendingSelection = $null; SelectionPath = $null
+            }
+        }
+    }
+
+    $runId = if ($PayloadRunId -gt 0) { $PayloadRunId } else { & $Operations.LatestRun }
+    if ($runId -isnot [long] -or $runId -le 0) {
+        throw 'Payload selection did not return a valid workflow run ID.'
+    }
+    $generation = "$runId-$([guid]::NewGuid().ToString('N'))"
+    $directory = Join-Path $CacheDirectory $generation
+    New-Item -Path $directory -ItemType Directory | Out-Null
+    $complete = $false
+    try {
+        Write-Host "Payload: downloading run $runId"
+        & $Operations.Download $runId $Architecture $directory | Out-Null
+        $nodeVersion = Assert-LocalPackagePayload $directory $Architecture
+        Assert-LocalPackagePayloadIsSafe $directory
+    $complete = $true
+    }
+    finally {
+    if (-not $complete) { Remove-Item -LiteralPath $directory -Recurse -Force }
+    }
+
+    # The caller commits the selection and retires the replaced generation
+    # through Complete-LocalPackagePayload once its consumer accepts the
+    # payload: committing here would leave a failed run selecting a payload
+    # that was never successfully deployed or composed.
+    $superseded = $null
+    if ($null -ne $current) {
+    $old = Join-Path $CacheDirectory $current['generation']
+    if ((Test-Path -LiteralPath $old -PathType Container) -and
+        (([IO.File]::GetAttributes($old) -band [IO.FileAttributes]::ReparsePoint) -eq 0)) {
+        $superseded = $old
+    }
+    }
+    return [pscustomobject]@{
+    Directory = $directory; NodeVersion = $nodeVersion
+    CacheHit = $false; Superseded = $superseded
+    PendingSelection = [ordered]@{
+        schemaVersion = $script:StateSchema
+        architecture = $Architecture
+        runId = $runId
+        generation = $generation
+    }
+    SelectionPath = $selectionPath
+    }
+}
+
+function Complete-LocalPackagePayload {
+    param($Payload)
+
+    if ($null -ne $Payload.PendingSelection) {
+        Write-LocalPackageRecord $Payload.SelectionPath $Payload.PendingSelection
+    }
+    if ($Payload.Superseded) {
+        Remove-Item -LiteralPath $Payload.Superseded -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Enter-LocalPackageBuildLock {
+    param([string]$Path)
+
+    New-Item -Path (Split-Path $Path -Parent) -ItemType Directory -Force | Out-Null
+    try {
+        # The open handle is the lock, so the operating system releases it
+        # even when the holder is killed; the file left behind is inert.
+        return [IO.FileStream]::new(
+            $Path,
+            [IO.FileMode]::OpenOrCreate,
+            [IO.FileAccess]::ReadWrite,
+            [IO.FileShare]::None)
+    }
+    catch [IO.IOException] {
+        $failure = @($_.Exception, $_.Exception.InnerException) |
+            Where-Object { $_ -is [IO.IOException] } |
+            Select-Object -First 1
+        # Only a sharing or lock violation means another run holds the file.
+        if (($failure.HResult -band 0xFFFF) -notin @(32, 33)) { throw }
+        throw (
+            "Another Build-LocalMSIX.ps1 run in this checkout holds $Path. " +
+            'Wait for it to finish, or compose from another checkout: runs in one ' +
+            'checkout share content\openclaw and the payload cache.'
+        )
+    }
+}
+
+function Invoke-LocalPackageMsixBuild {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [Parameter(Mandatory)][ValidateSet('x64', 'arm64')][string]$Architecture,
+        [string]$PayloadDirectory,
+        [long]$PayloadRunId,
+        [switch]$RefreshPayload,
+        [Parameter(Mandatory)][scriptblock]$Compose,
+        [hashtable]$Operations = @{}
+    )
+
+    if ($PayloadRunId -lt 0) { throw '-PayloadRunId must be a positive workflow run ID.' }
+    if ($PayloadDirectory -and ($PayloadRunId -ne 0 -or $RefreshPayload)) {
+        throw '-PayloadDirectory cannot be combined with -PayloadRunId or -RefreshPayload.'
+    }
+    $services = Get-LocalPackageServices $Operations
+    $msixRoot = Join-Path ([IO.Path]::GetFullPath($RepositoryRoot)) 'artifacts\local-msix'
+    # Every composition in a checkout rewrites the same content\ staging tree
+    # and reads this cache, so one run holds the checkout at a time. That also
+    # keeps a refresh from retiring a generation another run is still reading.
+    $lock = Enter-LocalPackageBuildLock (Join-Path $msixRoot '.lock')
+    try {
+        if ($PayloadDirectory) {
+            & $Compose (Resolve-Path -LiteralPath $PayloadDirectory -ErrorAction Stop).Path
+            return
+        }
+
+        $cacheDirectory = Join-Path $msixRoot "payloads\$Architecture"
+        $runId = $PayloadRunId
+        if ($runId -eq 0) {
+            # An ordinary build composes the latest successful payload, so the
+            # cache only avoids downloading a run it already holds. Falling back
+            # to it here could silently compose a superseded payload.
+            try { $runId = & $services.LatestRun }
+            catch {
+                $selection = $null
+                try { $selection = Read-LocalPackageRecord (Join-Path $cacheDirectory 'current.json') }
+                catch { $selection = $null }
+                $pin = if ($null -ne $selection -and $selection['runId'] -is [long] -and $selection['runId'] -gt 0) {
+                    "-PayloadRunId $($selection['runId']) to reuse the cached payload"
+                }
+                else { '-PayloadRunId <id>' }
+                throw (
+                    "Cannot find the latest successful payload run: $($_.Exception.Message) " +
+                    "To compose without querying GitHub, pass $pin, or -PayloadDirectory <path>."
+                )
+            }
+            if ($runId -isnot [long] -or $runId -le 0) {
+                throw 'Payload selection did not return a valid workflow run ID.'
+            }
+        }
+        $payload = Resolve-LocalPackagePayload -CacheDirectory $cacheDirectory `
+            -Architecture $Architecture -PayloadRunId $runId `
+            -RefreshPayload:$RefreshPayload -Operations $services
+        # The composer applies checks this owner does not, so a payload becomes
+        # the cached selection only once composition accepts it, as a deployment
+        # commits only after registering. Nothing links a rejected download, so
+        # it is discarded rather than left for a retry to trip over.
+        $accepted = $false
+        try {
+            & $Compose $payload.Directory
+            $accepted = $true
+        }
+        finally {
+            if ($accepted) {
+                Complete-LocalPackagePayload $payload
+                # After a success the cache holds only the selected generation.
+                # This run holds the checkout and nothing links a composition's
+                # payload, so any other generation was left by an interrupted
+                # run, including a first download that never selected one or a
+                # generation an unreadable selection could no longer name.
+                $selected = [IO.Path]::GetFileName($payload.Directory)
+                foreach ($generation in Get-ChildItem -LiteralPath $cacheDirectory -Directory -Force) {
+                    if ($generation.Name -cne $selected -and
+                        $generation.Name -match '^[1-9]\d*-[0-9a-f]{32}$' -and
+                        ($generation.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+                        Remove-Item -LiteralPath $generation.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                    }
+                }
+            }
+            elseif (-not $payload.CacheHit) {
+                Remove-Item -LiteralPath $payload.Directory -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    finally { $lock.Dispose() }
+}
+
+function Resolve-LocalPackageRuntime {
+    param(
+        [string]$RuntimeDirectory,
+        [string]$Architecture,
+        [string]$NodeVersion,
+        [hashtable]$Operations
+    )
+
+    New-Item -Path $RuntimeDirectory -ItemType Directory -Force | Out-Null
+    $name = "node-v$NodeVersion-win-$Architecture.zip"
+    $path = Join-Path $RuntimeDirectory $name
+    if (Test-Path -LiteralPath $path -PathType Leaf) {
+        try {
+            & $Operations.TestArchive $path ([IO.Path]::GetFileNameWithoutExtension($name)) | Out-Null
+            Write-Host "Node.js runtime: cached ($name)"
+            return $path
+        }
+        catch {
+            Write-Host "Node.js runtime: replacing unusable cache ($($_.Exception.Message))"
+            Remove-Item -LiteralPath $path -Force
+        }
+    }
+    Write-Host "Node.js runtime: downloading $name"
+    & $Operations.DownloadRuntime $NodeVersion $name $path | Out-Null
+    & $Operations.TestArchive $path ([IO.Path]::GetFileNameWithoutExtension($name)) | Out-Null
+    return $path
+}
+
+function New-LocalPackageLayout {
+    param(
+        [string]$LayoutDirectory,
+        [string]$RepositoryRoot,
+        [string]$HostExecutable,
+        [string]$SessionHostExecutable,
+        [string]$MxcRuntimeDirectory,
+        [string]$PayloadDirectory,
+        [string]$RuntimeArchive,
+        [string]$Architecture,
+        [string]$Version,
+        [Parameter(Mandatory)]$Identity
+    )
+
+    New-Item -Path $LayoutDirectory -ItemType Directory -Force | Out-Null
+
+    $manifestPath = Join-Path $LayoutDirectory 'AppxManifest.xml'
+    [xml]$manifest = Get-Content -LiteralPath (
+        Join-Path $RepositoryRoot 'src\OpenClaw.Launcher\Package.appxmanifest'
+    ) -Raw
+    $identityNode = $manifest.SelectSingleNode("/*[local-name()='Package']/*[local-name()='Identity']")
+    $identityNode.SetAttribute('Version', $Version)
+    $identityNode.SetAttribute('ProcessorArchitecture', $Architecture)
+    if ($Identity.Patch) {
+        $identityNode.SetAttribute('Name', $Identity.Name)
+        $manifest.SelectSingleNode(
+            "/*[local-name()='Package']/*[local-name()='Properties']/*[local-name()='DisplayName']"
+        ).InnerText = $Identity.DisplayName
+        foreach ($visual in $manifest.SelectNodes("//*[local-name()='VisualElements']")) {
+            $visual.SetAttribute('DisplayName', $Identity.DisplayName)
+        }
+        # Aliases are per-user and global, so an alias left unrenamed would
+        # collide with the base identity's command instead of sitting beside it.
+        $aliases = @{
+            'openclaw.exe' = "$($Identity.AgentCommand).exe"
+            'clawctl.exe' = "$($Identity.ControlCommand).exe"
+        }
+        foreach ($alias in $manifest.SelectNodes("//*[local-name()='ExecutionAlias']")) {
+            $current = $alias.GetAttribute('Alias')
+            if (-not $aliases.ContainsKey($current)) {
+                throw "The package manifest declares an alias a patched identity cannot rename: $current."
+            }
+            $alias.SetAttribute('Alias', $aliases[$current])
+        }
+    }
+    $manifest.Save($manifestPath)
+
+    Copy-Item -LiteralPath $HostExecutable -Destination (Join-Path $LayoutDirectory 'openclaw.exe') -Force
+    $nodeScripts = Join-Path $LayoutDirectory 'node'
+    if (Test-Path -LiteralPath $nodeScripts) { Remove-Item -LiteralPath $nodeScripts -Recurse -Force }
+    Copy-Item -LiteralPath (Join-Path $RepositoryRoot 'src\OpenClaw.Launcher\node') `
+        -Destination $nodeScripts -Recurse
+    $images = Join-Path $LayoutDirectory 'Images'
+    if (Test-Path -LiteralPath $images) { Remove-Item -LiteralPath $images -Recurse -Force }
+    Copy-Item -LiteralPath (Join-Path $RepositoryRoot 'src\OpenClaw.Launcher\Images') `
+        -Destination $images -Recurse
+
+    # A junction keeps the expanded application out of a second copy; the
+    # payload is hundreds of megabytes and never modified here.
+    $applicationLink = Join-Path $LayoutDirectory 'app'
+    $applicationTarget = Join-Path $PayloadDirectory 'app'
+    $existing = if (Test-Path -LiteralPath $applicationLink) {
+        Get-Item -LiteralPath $applicationLink -Force
+    }
+    else { $null }
+    if ($null -ne $existing -and
+        (($existing.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -or
+            $existing.Target -ne $applicationTarget)) {
+        Remove-Item -LiteralPath $applicationLink -Recurse -Force
+        $existing = $null
+    }
+    if ($null -eq $existing) {
+        New-Item -ItemType Junction -Path $applicationLink -Target $applicationTarget | Out-Null
+    }
+
+    $runtime = Join-Path $LayoutDirectory 'runtime'
+    New-Item -Path $runtime -ItemType Directory -Force | Out-Null
+    foreach ($stale in Get-ChildItem -LiteralPath $runtime -File) {
+        if ($stale.Name -ne [IO.Path]::GetFileName($RuntimeArchive)) {
+            Remove-Item -LiteralPath $stale.FullName -Force
+        }
+    }
+    # Replace the layout copy every time. Testing only for a file of the right
+    # name would keep a truncated archive from an interrupted copy forever,
+    # including under -Force, and clawctl setup would then read the bad copy.
+    $runtimeTarget = Join-Path $runtime ([IO.Path]::GetFileName($RuntimeArchive))
+    $runtimeStaging = "$runtimeTarget.$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        Copy-Item -LiteralPath $RuntimeArchive -Destination $runtimeStaging -Force
+        [IO.File]::Move($runtimeStaging, $runtimeTarget, $true)
+    }
+    finally {
+        if (Test-Path -LiteralPath $runtimeStaging) {
+            Remove-Item -LiteralPath $runtimeStaging -Force
+        }
+    }
+
+    $sessionHost = Join-Path (Join-Path $LayoutDirectory 'session-host') $Architecture
+    if (Test-Path -LiteralPath $sessionHost) {
+        Remove-Item -LiteralPath $sessionHost -Recurse -Force
+    }
+    New-Item -Path $sessionHost -ItemType Directory -Force | Out-Null
+    Copy-Item `
+        -LiteralPath $SessionHostExecutable `
+        -Destination (Join-Path $sessionHost 'openclaw-session-host.exe') `
+        -Force
+
+    $mxc = Join-Path (Join-Path $LayoutDirectory 'mxc') $Architecture
+    if (Test-Path -LiteralPath $mxc) {
+        Remove-Item -LiteralPath $mxc -Recurse -Force
+    }
+    New-Item -Path $mxc -ItemType Directory -Force | Out-Null
+    foreach ($item in Get-ChildItem -LiteralPath $MxcRuntimeDirectory -Force) {
+        Copy-Item -LiteralPath $item.FullName -Destination $mxc -Recurse -Force
+    }
+
+    return $manifestPath
+}
+
+function Test-LocalPackageOwnership {
+    param($Installed, [string]$LayoutDirectory)
+
+    # An identity can only have one registration, so "ours" means the installed
+    # location is this checkout's layout. Anything else belongs to another
+    # checkout or tool even though the name and publisher match.
+    if ($null -eq $Installed -or [string]::IsNullOrWhiteSpace($Installed.InstallLocation)) {
+        return $false
+    }
+    return [IO.Path]::GetFullPath($Installed.InstallLocation).TrimEnd('\') -ieq
+        [IO.Path]::GetFullPath($LayoutDirectory).TrimEnd('\')
+}
+
+function Get-LocalPackageOtherArchitecture {
+    param($Installed, [string]$StateRoot, [string]$Architecture)
+
+    # The native default means a registration made before it, or with an
+    # explicit -Architecture, can serve this checkout's other layout. Name it
+    # rather than reporting the checkout as a foreign owner.
+    foreach ($candidate in @('x64', 'arm64')) {
+        if ($candidate -ne $Architecture -and (Test-LocalPackageOwnership `
+            -Installed $Installed `
+            -LayoutDirectory (Join-Path $StateRoot "$candidate\layout"))) {
+            return $candidate
+        }
+    }
+    return $null
+}
+
+function Get-LocalPackageFileInventory {
+    param([string]$Directory)
+
+    return @(
+        Get-ChildItem -LiteralPath $Directory -File -Recurse |
+            Sort-Object FullName |
+            ForEach-Object {
+                $relativePath = [IO.Path]::GetRelativePath($Directory, $_.FullName)
+                "$relativePath`:$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash)"
+            }
+    )
+}
+
+function Get-LocalPackageSourceInventory {
+    param([string]$RepositoryRoot)
+
+    # The checkout files the launcher and session-host publishes read. Each
+    # project's bin and obj hold build output that every publish rewrites, so
+    # hashing them would make every deployment look changed.
+    $projectFiles = foreach ($project in @(
+        'OpenClaw.Launcher', 'OpenClaw.SessionHost', 'OpenClaw.SessionProtocol'
+    )) {
+        foreach ($entry in Get-ChildItem -LiteralPath (Join-Path $RepositoryRoot "src\$project") -Force) {
+            if ($entry.PSIsContainer -and $entry.Name -in @('bin', 'obj')) { continue }
+            $files = if ($entry.PSIsContainer) {
+                Get-ChildItem -LiteralPath $entry.FullName -File -Recurse -Force
+            }
+            else { $entry }
+            foreach ($file in $files) {
+                $relativePath = [IO.Path]::GetRelativePath($RepositoryRoot, $file.FullName)
+                "$relativePath`:$((Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash)"
+            }
+        }
+    }
+    $buildFiles = foreach ($name in @('Directory.Build.props', 'Directory.Packages.props', 'global.json')) {
+        $path = Join-Path $RepositoryRoot $name
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            "$name`:$((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash)"
+        }
+        else { "$name`:absent" }
+    }
+    return @($projectFiles | Sort-Object) + @($buildFiles)
+}
+
+function Test-LocalPackageLayout {
+    param(
+        [string]$LayoutDirectory,
+        [string]$PayloadDirectory,
+        [string]$NodeScriptsDirectory,
+        [string]$RuntimeArchiveName,
+        [string]$Architecture
+    )
+
+    # The registered package serves these files directly, so a short circuit
+    # must confirm the live layout, not just that a previous run wrote one.
+    foreach ($relative in @(
+        'AppxManifest.xml',
+        'openclaw.exe',
+        "runtime\$RuntimeArchiveName",
+        "session-host\$Architecture\openclaw-session-host.exe",
+        "mxc\$Architecture\wxc-exec.exe",
+        "mxc\$Architecture\plm.exe",
+        "mxc\$Architecture\mxc-runtime.json",
+        'node\native-redirect.mjs'
+    )) {
+        if (-not (Test-Path -LiteralPath (Join-Path $LayoutDirectory $relative) -PathType Leaf)) {
+            return $false
+        }
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $LayoutDirectory 'Images') -PathType Container)) {
+        return $false
+    }
+    $expectedNodeScripts = Get-LocalPackageFileInventory -Directory $NodeScriptsDirectory
+    $actualNodeScripts = Get-LocalPackageFileInventory -Directory (Join-Path $LayoutDirectory 'node')
+    if ([string]::Join("`n", $actualNodeScripts) -cne [string]::Join("`n", $expectedNodeScripts)) {
+        return $false
+    }
+    $link = Join-Path $LayoutDirectory 'app'
+    if (-not (Test-Path -LiteralPath $link -PathType Container)) { return $false }
+    $item = Get-Item -LiteralPath $link -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -or
+        $item.Target -ne (Join-Path $PayloadDirectory 'app')) {
+        return $false
+    }
+    return (Test-Path -LiteralPath (Join-Path $link 'openclaw.mjs') -PathType Leaf)
+}
+
+function ConvertTo-LocalPackageArchitecture {
+    param([Runtime.InteropServices.Architecture]$OSArchitecture)
+
+    switch ($OSArchitecture) {
+        ([Runtime.InteropServices.Architecture]::X64) { return 'x64' }
+        ([Runtime.InteropServices.Architecture]::Arm64) { return 'arm64' }
+    }
+    throw "No local package can be built for this $OSArchitecture device. Pass -Architecture x64 or -Architecture arm64 explicitly."
+}
+
+function Resolve-LocalPackageArchitecture {
+    param([string]$Architecture, [bool]$Supplied, [hashtable]$Services)
+
+    if ($Supplied) { return $Architecture }
+    $native = & $Services.NativeArchitecture
+    if ($native -isnot [string] -or $native -cnotin @('x64', 'arm64')) {
+        throw "The native architecture adapter returned an unsupported value: $native"
+    }
+    return $native
+}
+
+function Get-LocalPackageOperations {
+    return @{
+        Now = { Get-Date }
+        NativeArchitecture = {
+            ConvertTo-LocalPackageArchitecture ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture)
+        }
+        Preflight = {
+            param($architecture)
+            if (-not $IsWindows) { throw 'Registering a local package requires Windows.' }
+            $key = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock'
+            $unlock = Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue
+            if ($null -eq $unlock -or
+                $null -eq $unlock.PSObject.Properties['AllowDevelopmentWithoutDevLicense'] -or
+                [int]$unlock.AllowDevelopmentWithoutDevLicense -ne 1) {
+                throw 'Developer Mode is required to register an unpackaged layout. Enable it in Settings > System > For developers.'
+            }
+            $osArchitecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
+            if ($architecture -eq 'arm64' -and $osArchitecture -ne 'arm64') {
+                throw "An arm64 package cannot be registered on this $osArchitecture device."
+            }
+            if (-not (Get-Command dotnet -CommandType Application -ErrorAction SilentlyContinue)) {
+                throw 'The pinned .NET SDK is required. Install the SDK selected by global.json.'
+            }
+            $installer = Join-Path (
+                [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFilesX86)
+            ) 'Microsoft Visual Studio\Installer'
+            if (-not (Get-Command vswhere.exe -CommandType Application -ErrorAction SilentlyContinue)) {
+                if (-not (Test-Path -LiteralPath (Join-Path $installer 'vswhere.exe') -PathType Leaf)) {
+                    throw 'vswhere.exe was not found. Install Visual Studio Build Tools with the Desktop development with C++ workload.'
+                }
+                $env:Path = "$installer;$env:Path"
+            }
+        }
+        LatestRun = {
+            $gh = Get-LocalPackageGitHubCommand
+            $lines = @(& $gh.Source run list --repo openclaw/openclaw-windows-packaging `
+                --workflow gateway-msix.yml --branch main --status success --limit 1 --json databaseId)
+            if ($LASTEXITCODE -ne 0) {
+                throw "Unable to query the payload workflow (exit $LASTEXITCODE). Check gh authentication, or pass -PayloadDirectory."
+            }
+            $runs = @([string]::Join("`n", [string[]]$lines) | ConvertFrom-Json)
+            if ($runs.Count -ne 1) {
+                throw 'No successful payload workflow run was found. Pass -PayloadRunId or -PayloadDirectory.'
+            }
+            return [long]$runs[0].databaseId
+        }
+        Download = {
+            param($runId, $architecture, $directory)
+            $gh = Get-LocalPackageGitHubCommand
+            & $gh.Source run download $runId --repo openclaw/openclaw-windows-packaging `
+                --name "openclaw-gateway-payload-$architecture" --dir $directory |
+                ForEach-Object { Write-Host $_ }
+            if ($LASTEXITCODE -ne 0) {
+                throw "Payload download failed (exit $LASTEXITCODE). Check gh access and artifact retention, or pass -PayloadDirectory."
+            }
+            return $null
+        }
+        DownloadRuntime = {
+            param($nodeVersion, $name, $path)
+            Invoke-WebRequest -Uri "https://nodejs.org/dist/v$nodeVersion/$name" -OutFile $path
+            return $null
+        }
+        TestArchive = {
+            param($path, $expectedRoot)
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $archive = [IO.Compression.ZipFile]::OpenRead($path)
+            try {
+                $entries = @($archive.Entries | Where-Object { $_.FullName -ieq "$expectedRoot/node.exe" })
+                if ($entries.Count -ne 1) {
+                    throw "The Node.js archive must contain exactly one '$expectedRoot/node.exe' entry."
+                }
+            }
+            finally { $archive.Dispose() }
+            return $null
+        }
+        StageMxcRuntime = {
+            param($repositoryRoot, $architecture, $output)
+            & (Join-Path $repositoryRoot 'scripts\Get-MxcRuntime.ps1') `
+                -Architecture $architecture `
+                -OutputDirectory $output
+            return $null
+        }
+        CheckoutCommit = { Get-LocalPackageCheckoutCommit }
+        Publish = {
+            param($project, $architecture, $output, $metadata)
+            # Bake the deployment's identity into the launcher so `clawctl
+            # --version` identifies what was deployed. An empty commit, from a
+            # missing git, falls back to the project's own default.
+            $metadataArgs = @()
+            if ($null -ne $metadata) {
+                if ($metadata.PackageCommit) {
+                    $metadataArgs += "-p:ClawCtlPackageCommit=$($metadata.PackageCommit)"
+                }
+                $metadataArgs += "-p:ClawCtlPackageVersion=$($metadata.PackageVersion)"
+                $metadataArgs += "-p:ClawCtlPayloadVersion=$($metadata.PayloadVersion)"
+                $metadataArgs += "-p:ClawCtlPayloadCommit=$($metadata.PayloadCommit)"
+            }
+            & dotnet publish $project --configuration Release --runtime "win-$architecture" `
+                --self-contained "-p:Platform=$architecture" -p:PublishAot=true `
+                @metadataArgs `
+                --output $output --nologo |
+                ForEach-Object { Write-Host $_ }
+            if ($LASTEXITCODE -ne 0) {
+                throw "The NativeAOT publish failed (exit $LASTEXITCODE)."
+            }
+            return $null
+        }
+        GetPackage = {
+            param($name)
+            $package = Get-AppxPackage -Name $name -ErrorAction Stop |
+                Where-Object Name -eq $name |
+                Select-Object -First 1
+            if ($null -eq $package) { return $null }
+            return [pscustomobject]@{
+                Version = $package.Version.ToString()
+                PackageFullName = $package.PackageFullName
+                PackageFamilyName = $package.PackageFamilyName
+                InstallLocation = $package.InstallLocation
+                IsDevelopmentMode = [bool]$package.IsDevelopmentMode
+                Status = $package.Status.ToString()
+            }
+        }
+        RegisterPackage = {
+            param($manifestPath)
+            Add-AppxPackage -Register $manifestPath -ErrorAction Stop
+            return $null
+        }
+        RemovePackage = {
+            param($packageFullName, $preserveData)
+            if ($preserveData) {
+                Remove-AppxPackage -Package $packageFullName -PreserveApplicationData -ErrorAction Stop
+            }
+            else {
+                Remove-AppxPackage -Package $packageFullName -ErrorAction Stop
+            }
+            return $null
+        }
+        TestPath = { param($path) Test-Path -LiteralPath $path }
+        RunSetup = {
+            param($packageName, $packageFamilyName)
+            Invoke-LocalPackageControlCommand `
+                -PackageName $packageName `
+                -PackageFamilyName $packageFamilyName `
+                -Arguments 'setup'
+            return $null
+        }
+    }
+}
+
+function Invoke-LocalPackagePhase {
+    param([hashtable]$ProgressState, [string]$Label, [scriptblock]$Action)
+
+    $ProgressState.Stage = $Label
+    Write-Host "`n[$Label]"
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    $result = & $Action
+    $stopwatch.Stop()
+    Write-Host ('  done in {0:0.00}s' -f $stopwatch.Elapsed.TotalSeconds)
+    return $result
+}
+
+function Get-LocalPackageServices {
+    param([hashtable]$Overrides)
+
+    $services = Get-LocalPackageOperations
+    foreach ($name in $Overrides.Keys) {
+        if (-not $services.ContainsKey($name) -or $Overrides[$name] -isnot [scriptblock]) {
+            throw "Unknown or invalid local package operation adapter: $name"
+        }
+        $services[$name] = $Overrides[$name]
+    }
+    return $services
+}
+
+function Remove-LocalPackageRegistration {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [ValidateSet('x64', 'arm64')][string]$Architecture,
+        [string]$Patch,
+        [hashtable]$Operations = @{}
+    )
+
+    $identityArguments = @{}
+    if ($PSBoundParameters.ContainsKey('Patch')) { $identityArguments.Patch = $Patch }
+    $identity = Get-LocalPackageIdentity @identityArguments
+    $services = Get-LocalPackageServices $Operations
+    $Architecture = Resolve-LocalPackageArchitecture $Architecture `
+        $PSBoundParameters.ContainsKey('Architecture') $services
+    $state = Join-Path ([IO.Path]::GetFullPath($RepositoryRoot)) "$($identity.StateDirectory)\$Architecture"
+    $layoutDirectory = Join-Path $state 'layout'
+    # The legacy identity only ever registered the base layout, so a patched
+    # identity has no legacy registration to account for.
+    $packageNames = if ($identity.Patch) {
+        @($identity.Name)
+    }
+    else {
+        @($identity.Name, $script:LegacyPackageName)
+    }
+    $registrations = @(
+        foreach ($packageName in $packageNames) {
+            $installed = & $services.GetPackage $packageName
+            if ($null -ne $installed) {
+                [pscustomobject]@{
+                    Name = $packageName
+                    Package = $installed
+                }
+            }
+        }
+    )
+    if ($registrations.Count -eq 0) {
+        Write-Host "No $($identity.Name) local package is registered for the current user."
+    }
+    foreach ($registration in $registrations) {
+        $installed = $registration.Package
+        if (-not $installed.IsDevelopmentMode) {
+            throw (
+                "$($registration.Name) is installed from a package, not a " +
+                'local layout. Remove it deliberately with Remove-AppxPackage ' +
+                'if that is what you want.'
+            )
+        }
+        if (-not (Test-LocalPackageOwnership `
+            -Installed $installed `
+            -LayoutDirectory $layoutDirectory)) {
+            $otherArchitecture = Get-LocalPackageOtherArchitecture $installed `
+                (Join-Path ([IO.Path]::GetFullPath($RepositoryRoot)) $identity.StateDirectory) $Architecture
+            if ($otherArchitecture) {
+                throw (
+                    "$($registration.Name) is registered from this checkout's " +
+                    "$otherArchitecture layout. Re-run -Unregister with " +
+                    "-Architecture $otherArchitecture."
+                )
+            }
+            throw (
+                "$($registration.Name) is registered from another location: " +
+                "$($installed.InstallLocation). Run -Unregister from that " +
+                'checkout instead; this one does not own that registration.'
+            )
+        }
+    }
+    foreach ($registration in $registrations) {
+        $installed = $registration.Package
+        # Development-mode packages allow preserving app data, so unregistering
+        # does not throw away the extracted Node.js runtime.
+        & $services.RemovePackage $installed.PackageFullName $true | Out-Null
+        Write-Host "Unregistered $($installed.PackageFullName); its app data was preserved."
+    }
+    $statePath = Join-Path $state 'state.json'
+    if (Test-Path -LiteralPath $statePath) { Remove-Item -LiteralPath $statePath -Force }
+    Write-Host "Cached payload and runtime are kept under $state."
+}
+
+function Invoke-LocalPackageDeployment {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [ValidateSet('x64', 'arm64')][string]$Architecture,
+        [string]$PayloadDirectory,
+        [long]$PayloadRunId,
+        [switch]$RefreshPayload,
+        [switch]$ReplaceExistingInstall,
+        [switch]$Force,
+        [switch]$SkipSetup,
+        [string]$Patch,
+        [hashtable]$Operations = @{}
+    )
+
+    if ($PayloadRunId -lt 0) { throw '-PayloadRunId must be a positive workflow run ID.' }
+    if ($PayloadDirectory -and ($PayloadRunId -ne 0 -or $RefreshPayload)) {
+        throw '-PayloadDirectory cannot be combined with -PayloadRunId or -RefreshPayload.'
+    }
+
+    $identityArguments = @{}
+    if ($PSBoundParameters.ContainsKey('Patch')) { $identityArguments.Patch = $Patch }
+    $identity = Get-LocalPackageIdentity @identityArguments
+    $services = Get-LocalPackageServices $Operations
+    $Architecture = Resolve-LocalPackageArchitecture $Architecture `
+        $PSBoundParameters.ContainsKey('Architecture') $services
+    $root = (Resolve-Path -LiteralPath $RepositoryRoot -ErrorAction Stop).Path
+    # A patched identity owns its whole state root. Its layout links the payload
+    # it was registered with, so sharing a cache would let another identity's
+    # refresh retire a payload this registration still serves.
+    $stateRoot = Join-Path $root "$($identity.StateDirectory)\$Architecture"
+    $layoutDirectory = Join-Path $stateRoot 'layout'
+    $statePath = Join-Path $stateRoot 'state.json'
+    $progress = @{ Stage = 'preparing' }
+    $total = [Diagnostics.Stopwatch]::StartNew()
+
+    try {
+        & $services.Preflight $Architecture | Out-Null
+        Write-Host "Registering a local development build of $($identity.Name) ($Architecture)."
+        Write-Host "Layout: $layoutDirectory"
+
+        $installed = Invoke-LocalPackagePhase $progress 'Check current registration' {
+            & $services.GetPackage $identity.Name
+        }
+        $legacyInstalled = if ($identity.Patch) {
+            $null
+        }
+        else {
+            & $services.GetPackage $script:LegacyPackageName
+        }
+        if ($null -ne $legacyInstalled) {
+            $legacyOwned = Test-LocalPackageOwnership `
+                -Installed $legacyInstalled `
+                -LayoutDirectory $layoutDirectory
+            if (-not $ReplaceExistingInstall) {
+                $location = if ($legacyOwned) {
+                    'this checkout layout'
+                }
+                else {
+                    [string]$legacyInstalled.InstallLocation
+                }
+                throw (
+                    "$script:LegacyPackageName is still registered from " +
+                    "$location. The Partner Center identity cannot replace " +
+                    'that registration in place. Run -Unregister from its ' +
+                    'owning checkout, or re-run with -ReplaceExistingInstall ' +
+                    'to remove it explicitly before deployment.'
+                )
+            }
+
+            $preserveLegacyData = [bool]$legacyInstalled.IsDevelopmentMode
+            Write-Warning (
+                "Removing legacy registration $($legacyInstalled.PackageFullName) " +
+                'before deploying the Partner Center identity; its packaged ' +
+                'LocalState does not transfer to the new package family.'
+            )
+            & $services.RemovePackage `
+                $legacyInstalled.PackageFullName `
+                $preserveLegacyData |
+                Out-Null
+        }
+        if ($null -ne $installed -and -not $installed.IsDevelopmentMode) {
+            if (-not $ReplaceExistingInstall) {
+                throw (
+                    "$($identity.Name) is already installed from a package (version $($installed.Version)). " +
+                    'Windows cannot replace a packaged install with a local layout. ' +
+                    'Re-run with -ReplaceExistingInstall to remove it first; its packaged app data ' +
+                    'cannot be preserved across that switch.'
+                )
+            }
+            Write-Warning "Removing the packaged $($identity.Name) $($installed.Version); its app data cannot be preserved."
+            & $services.RemovePackage $installed.PackageFullName $false | Out-Null
+            $installed = $null
+        }
+        elseif ($null -ne $installed -and
+            -not (Test-LocalPackageOwnership -Installed $installed -LayoutDirectory $layoutDirectory)) {
+            # A development registration from another checkout or tool. Only one
+            # registration of this identity can exist, but it is not ours to take.
+            if (-not $ReplaceExistingInstall) {
+                $otherArchitecture = Get-LocalPackageOtherArchitecture $installed `
+                    (Join-Path $root $identity.StateDirectory) $Architecture
+                if ($otherArchitecture) {
+                    throw (
+                        "$($identity.Name) is registered from this checkout's $otherArchitecture " +
+                        "layout. Run -Unregister -Architecture $otherArchitecture first, then deploy again."
+                    )
+                }
+                throw (
+                    "$($identity.Name) is already registered from another location: " +
+                    "$($installed.InstallLocation). Run -Unregister from that checkout, or " +
+                    're-run with -ReplaceExistingInstall to take over the identity here.'
+                )
+            }
+            Write-Warning "Taking over the registration at $($installed.InstallLocation)."
+        }
+
+        New-Item -Path $stateRoot -ItemType Directory -Force | Out-Null
+        $payload = Invoke-LocalPackagePhase $progress 'Resolve payload' {
+            Resolve-LocalPackagePayload -CacheDirectory (Join-Path $stateRoot 'payloads') `
+                -Architecture $Architecture -PayloadDirectory $PayloadDirectory `
+                -PayloadRunId $PayloadRunId -RefreshPayload:$RefreshPayload -Operations $services
+        }
+        $payloadMetadata = Read-LocalPackageRecord (
+            Join-Path $payload.Directory 'payload-metadata.json'
+        )
+        $previous = Read-LocalPackageRecord $statePath
+        $now = & $services.Now
+        $newVersion = {
+            Get-LocalPackageNextVersion `
+                -InstalledVersion $(if ($null -ne $installed) { $installed.Version } else { '' }) `
+                -PreviousVersion $(if ($null -ne $previous) { [string]$previous['version'] } else { '' }) `
+                -Now $now
+        }
+        $publishMetadata = @{
+            PackageVersion = ''
+            PackageCommit = [string](& $services.CheckoutCommit)
+            PayloadVersion = if ([string]::IsNullOrWhiteSpace(
+                [string]$payloadMetadata['packageVersion'])) {
+                'unknown'
+            }
+            else {
+                [string]$payloadMetadata['packageVersion']
+            }
+            PayloadCommit = if (
+                [string]$payloadMetadata['resolvedCommit'] -match '^[0-9a-fA-F]{40}$') {
+                ([string]$payloadMetadata['resolvedCommit']).ToLowerInvariant()
+            }
+            else {
+                'unknown'
+            }
+        }
+        $runtimeArchive = Invoke-LocalPackagePhase $progress 'Resolve Node.js runtime' {
+            Resolve-LocalPackageRuntime -RuntimeDirectory (Join-Path $stateRoot 'runtime') `
+                -Architecture $Architecture -NodeVersion $payload.NodeVersion -Operations $services
+        }
+        $mxcRuntimeDirectory = Join-Path $stateRoot 'mxc'
+        Invoke-LocalPackagePhase $progress 'Stage MXC runtime' {
+            & $services.StageMxcRuntime $root $Architecture $mxcRuntimeDirectory
+        } | Out-Null
+        $manifestSource = Join-Path $root 'src\OpenClaw.Launcher\Package.appxmanifest'
+        $manifestHash = (Get-FileHash -LiteralPath $manifestSource -Algorithm SHA256).Hash
+        $mxcHashes = @(
+            Get-ChildItem -LiteralPath $mxcRuntimeDirectory -File -Recurse |
+                Sort-Object FullName |
+                ForEach-Object {
+                    "$($_.Name):$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash)"
+                }
+        )
+        $imageHashes = @(
+            Get-ChildItem -LiteralPath (Join-Path $root 'src\OpenClaw.Launcher\Images') -File -Recurse |
+                Sort-Object FullName |
+                ForEach-Object { "$($_.Name):$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash)" }
+        )
+        $nodeScriptsDirectory = Join-Path $root 'src\OpenClaw.Launcher\node'
+        $nodeScriptHashes = Get-LocalPackageFileInventory -Directory $nodeScriptsDirectory
+        # The package version is compiled into the launcher, so a version change
+        # costs a full NativeAOT compile. The build inputs predict whether this
+        # deployment can stay current, letting a changed deployment publish once
+        # with the version it registers. They only choose that version: the
+        # published binaries below still decide "up to date", so an input missed
+        # here costs a second publish, never a stale package.
+        $inputFingerprint = Get-LocalPackageFingerprint (@(
+            $Architecture
+            $payload.Directory
+            [IO.Path]::GetFileName($runtimeArchive)
+            $publishMetadata.PackageCommit
+            $publishMetadata.PayloadVersion
+            $publishMetadata.PayloadCommit
+            $manifestHash
+        ) + $imageHashes + $nodeScriptHashes + $mxcHashes +
+            (Get-LocalPackageSourceInventory -RepositoryRoot $root))
+        $setupSatisfied = $SkipSetup -or ($null -ne $previous -and $previous['setupComplete'] -eq $true)
+        $registrationCurrent = -not $Force -and $null -ne $previous -and $null -ne $installed -and
+            $installed.IsDevelopmentMode -and
+            (Test-LocalPackageOwnership -Installed $installed -LayoutDirectory $layoutDirectory) -and
+            $previous['inputFingerprint'] -eq $inputFingerprint -and
+            $previous['version'] -eq $installed.Version -and
+            $installed.Status -ieq 'Ok' -and
+            $setupSatisfied -and
+            (Test-LocalPackageLayout -LayoutDirectory $layoutDirectory `
+                -PayloadDirectory $payload.Directory `
+                -NodeScriptsDirectory $nodeScriptsDirectory `
+                -RuntimeArchiveName ([IO.Path]::GetFileName($runtimeArchive)) `
+                -Architecture $Architecture)
+        $version = if ($registrationCurrent) { $installed.Version } else { & $newVersion }
+        $publishMetadata.PackageVersion = $version
+
+        $hostDirectory = Join-Path $stateRoot 'host'
+        Invoke-LocalPackagePhase $progress 'Build launcher (NativeAOT)' {
+            & $services.Publish (Join-Path $root 'src\OpenClaw.Launcher\OpenClaw.Launcher.csproj') `
+                $Architecture $hostDirectory $publishMetadata
+        } | Out-Null
+        $sessionHostDirectory = Join-Path $stateRoot 'session-host'
+        Invoke-LocalPackagePhase $progress 'Build session host (NativeAOT)' {
+            & $services.Publish (Join-Path $root 'src\OpenClaw.SessionHost\OpenClaw.SessionHost.csproj') `
+                $Architecture $sessionHostDirectory $null
+        } | Out-Null
+        $hostExecutable = Join-Path $hostDirectory 'openclaw.exe'
+        if (-not (& $services.TestPath $hostExecutable)) {
+            throw "The publish did not produce $hostExecutable."
+        }
+        $sessionHostExecutable = Join-Path $sessionHostDirectory 'openclaw-session-host.exe'
+        if (-not (& $services.TestPath $sessionHostExecutable)) {
+            throw "The publish did not produce $sessionHostExecutable."
+        }
+
+        $sessionHostInfo = Get-Item -LiteralPath $sessionHostExecutable
+        $sessionHostHash = (
+            Get-FileHash -LiteralPath $sessionHostExecutable -Algorithm SHA256
+        ).Hash
+        # Hash the launcher rather than trusting its timestamp: publish copies
+        # into the output directory and can refresh timestamps with no source
+        # change, which would defeat the up-to-date check on every run.
+        $outputFingerprint = {
+            Get-LocalPackageFingerprint (@(
+                $Architecture
+                $payload.Directory
+                [IO.Path]::GetFileName($runtimeArchive)
+                (Get-Item -LiteralPath $hostExecutable).Length.ToString()
+                (Get-FileHash -LiteralPath $hostExecutable -Algorithm SHA256).Hash
+                $sessionHostInfo.Length.ToString()
+                $sessionHostHash
+                $manifestHash
+            ) + $imageHashes + $nodeScriptHashes + $mxcHashes)
+        }
+        $fingerprint = & $outputFingerprint
+        if ($registrationCurrent -and $previous['fingerprint'] -eq $fingerprint) {
+            $total.Stop()
+            Write-Host "`nAlready up to date: $($installed.PackageFullName)"
+            Write-Host ('Total {0:0.00}s. Use -Force to re-register anyway.' -f $total.Elapsed.TotalSeconds)
+            return [pscustomobject]@{
+                Version = $installed.Version
+                PackageFullName = $installed.PackageFullName
+                LayoutDirectory = $layoutDirectory
+                Changed = $false
+            }
+        }
+
+        if ($registrationCurrent) {
+            Write-Host (
+                "`nThe published binaries changed although the recorded build inputs did not, " +
+                'for example after an SDK or toolchain update.'
+            )
+            $version = & $newVersion
+            $publishMetadata.PackageVersion = $version
+            Invoke-LocalPackagePhase $progress 'Rebuild launcher with package identity' {
+                & $services.Publish (
+                    Join-Path $root 'src\OpenClaw.Launcher\OpenClaw.Launcher.csproj'
+                ) $Architecture $hostDirectory $publishMetadata
+            } | Out-Null
+            $fingerprint = & $outputFingerprint
+        }
+
+        $manifestPath = Invoke-LocalPackagePhase $progress 'Assemble layout' {
+            New-LocalPackageLayout -LayoutDirectory $layoutDirectory -RepositoryRoot $root `
+                -HostExecutable $hostExecutable -SessionHostExecutable $sessionHostExecutable `
+                -MxcRuntimeDirectory $mxcRuntimeDirectory -PayloadDirectory $payload.Directory `
+                -RuntimeArchive $runtimeArchive -Architecture $Architecture -Version $version `
+                -Identity $identity
+        }
+        Invoke-LocalPackagePhase $progress 'Register package' {
+            # Re-registering over an existing development registration does not
+            # reliably repair one whose layout was deleted or damaged: the
+            # package still reports Status Ok while its aliases fail with "The
+            # process has no package identity". Removing first, preserving app
+            # data, makes registration deterministic and self-healing.
+            if ($null -ne $installed -and $installed.IsDevelopmentMode) {
+                & $services.RemovePackage $installed.PackageFullName $true | Out-Null
+            }
+            & $services.RegisterPackage $manifestPath
+        } | Out-Null
+
+        $registered = & $services.GetPackage $identity.Name
+        if ($null -eq $registered -or $registered.Version -ne $version -or
+            -not $registered.IsDevelopmentMode -or $registered.Status -inotin @('Ok', 'Ready')) {
+            throw 'The package did not register as a healthy local development build.'
+        }
+        Write-LocalPackageRecord $statePath ([ordered]@{
+            schemaVersion = $script:StateSchema
+            version = $version
+            fingerprint = $fingerprint
+            inputFingerprint = $inputFingerprint
+            setupComplete = $false
+            packageFullName = $registered.PackageFullName
+            layoutDirectory = $layoutDirectory
+            payloadDirectory = $payload.Directory
+        })
+
+        if (-not $SkipSetup) {
+            Invoke-LocalPackagePhase $progress 'Prepare bundled Node.js runtime' {
+                & $services.RunSetup $identity.Name $registered.PackageFamilyName
+            } | Out-Null
+        }
+
+        # Record completion only once the package is actually runnable, so a
+        # failed or skipped setup cannot be short-circuited as up to date.
+        Write-LocalPackageRecord $statePath ([ordered]@{
+            schemaVersion = $script:StateSchema
+            version = $version
+            fingerprint = $fingerprint
+            inputFingerprint = $inputFingerprint
+            setupComplete = (-not $SkipSetup)
+            packageFullName = $registered.PackageFullName
+            layoutDirectory = $layoutDirectory
+            payloadDirectory = $payload.Directory
+        })
+        Complete-LocalPackagePayload $payload
+
+        $total.Stop()
+        Write-Host "`nRegistered: $($registered.PackageFullName)"
+        Write-Host $(if ($SkipSetup) {
+            "Run ``$($identity.ControlCommand) setup`` once, then ``$($identity.AgentCommand)``."
+        }
+        else { "Ready to run: ``$($identity.AgentCommand)``" })
+        Write-Host ('Total {0:0.00}s.' -f $total.Elapsed.TotalSeconds)
+        return [pscustomobject]@{
+            Version = $version
+            PackageFullName = $registered.PackageFullName
+            LayoutDirectory = $layoutDirectory
+            Changed = $true
+        }
+    }
+    catch {
+        $total.Stop()
+        Write-Host "`nFAILED during $($progress.Stage): $($_.Exception.Message)"
+        throw
+    }
+}
+
+function Get-LocalPackageNextVersion {
+    param(
+        [string]$InstalledVersion,
+        [string]$PreviousVersion,
+        [datetime]$Now = (Get-Date)
+    )
+
+    $parse = {
+        param($value)
+        if (-not $value) { return [version]'0.0.0.0' }
+        $parsed = $null
+        if ($value -notmatch '^\d{1,5}\.\d{1,5}\.\d{1,5}\.\d{1,5}$' -or
+            -not [version]::TryParse($value, [ref]$parsed) -or
+            @($parsed.Major, $parsed.Minor, $parsed.Build, $parsed.Revision).
+                Where({ $_ -gt [uint16]::MaxValue }).Count -ne 0) {
+            throw "Invalid MSIX version '$value'. Use four numeric components from 0 through 65535."
+        }
+        return $parsed
+    }
+    $highest = & $parse $InstalledVersion
+    $previous = & $parse $PreviousVersion
+    if ($previous -gt $highest) { $highest = $previous }
+
+    $days = [int]($Now.Date - [datetime]'2020-01-01').TotalDays
+    if ($days -lt 0 -or $days -gt [uint16]::MaxValue) {
+        throw 'The current date cannot be encoded as a local package version.'
+    }
+    $candidate = [version]"0.1.$days.$([int]$Now.TimeOfDay.TotalSeconds % 65536)"
+    if ($candidate -gt $highest) { return $candidate.ToString(4) }
+
+    $parts = @($highest.Major, $highest.Minor, $highest.Build, $highest.Revision)
+    for ($index = 3; $index -ge 0; $index--) {
+        if ($parts[$index] -lt [uint16]::MaxValue) {
+            $parts[$index]++
+            return $parts -join '.'
+        }
+        $parts[$index] = 0
+    }
+    throw 'The local package version space is exhausted.'
+}
+
+Export-ModuleMember -Function Invoke-LocalPackageDeployment, Remove-LocalPackageRegistration,
+    Get-LocalPackageNextVersion, Invoke-LocalPackageMsixBuild

@@ -1,0 +1,35 @@
+{
+  "lspServers": {
+    "typescript-language-server": {
+      "command": "npx",
+      "args": [
+        "--no-install",
+        "typescript-language-server",
+        "--stdio"
+      ],
+      "fileExtensions": {
+        ".js": "javascript"
+      }
+    },
+    "roslyn-language-server": {
+      "command": "dotnet",
+      "args": [
+        "tool",
+        "exec",
+        "roslyn-language-server@5.12.0-1.26426.8",
+        "--source",
+        "https://api.nuget.org/v3/index.json",
+        "--",
+        "--stdio",
+        "--autoLoadProjects",
+        "--logLevel",
+        "Information",
+        "--extensionLogDirectory",
+        "artifacts\\roslyn-logs"
+      ],
+      "fileExtensions": {
+        ".cs": "csharp"
+      }
+    }
+  }
+}

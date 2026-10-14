@@ -1,0 +1,498 @@
+using System.Buffers;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+
+#if OPENCLAW_SESSION_HOST
+namespace OpenClaw.SessionHost;
+#else
+namespace OpenClaw.Launcher;
+#endif
+
+internal sealed class WindowsKillOnCloseJob : IDisposable
+{
+    private const uint CreateSuspended = 0x00000004;
+    private const uint CreateUnicodeEnvironment = 0x00000400;
+    private const uint JobObjectLimitKillOnJobClose = 0x00002000;
+    private const uint StartfUseStdHandles = 0x00000100;
+    private const int JobObjectExtendedLimitInformationClass = 9;
+    private const int StandardInputHandle = -10;
+    private const int StandardOutputHandle = -11;
+    private const int StandardErrorHandle = -12;
+    private readonly SafeJobHandle _handle;
+    private static readonly SearchValues<char> QuoteCharacters = SearchValues.Create(" \t\r\n\v\"");
+
+    private WindowsKillOnCloseJob(SafeJobHandle handle)
+    {
+        _handle = handle;
+    }
+
+    public static WindowsKillOnCloseJob Create()
+    {
+        SafeJobHandle handle = CreateJobObjectW(IntPtr.Zero, null);
+        if (handle.IsInvalid)
+        {
+            throw new Win32Exception(
+                Marshal.GetLastWin32Error(),
+                "Unable to create the OpenClaw process job.");
+        }
+
+        try
+        {
+            var information = new JobObjectExtendedLimitInformation
+            {
+                BasicLimitInformation = new JobObjectBasicLimitInformation
+                {
+                    LimitFlags = JobObjectLimitKillOnJobClose
+                }
+            };
+            int size = Marshal.SizeOf<JobObjectExtendedLimitInformation>();
+            IntPtr buffer = Marshal.AllocHGlobal(size);
+            try
+            {
+                Marshal.StructureToPtr(information, buffer, fDeleteOld: false);
+                if (!SetInformationJobObject(
+                        handle,
+                        JobObjectExtendedLimitInformationClass,
+                        buffer,
+                        (uint)size))
+                {
+                    throw new Win32Exception(
+                        Marshal.GetLastWin32Error(),
+                        "Unable to configure the OpenClaw process job.");
+                }
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+
+            return new WindowsKillOnCloseJob(handle);
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
+        }
+    }
+
+    public Process StartProcess(ProcessStartInfo startInfo) => StartProcess(startInfo, null, null, null);
+
+    public Process StartProcess(
+        ProcessStartInfo startInfo,
+        SafeHandle? input,
+        SafeHandle? output,
+        SafeHandle? standardError,
+        bool assignToJob = true)
+    {
+        ArgumentNullException.ThrowIfNull(startInfo);
+        if (startInfo.UseShellExecute)
+        {
+            throw new ArgumentException(
+                "Job processes cannot use shell execution.",
+                nameof(startInfo));
+        }
+        if (startInfo.RedirectStandardInput ||
+            startInfo.RedirectStandardOutput ||
+            startInfo.RedirectStandardError)
+        {
+            throw new ArgumentException(
+                "Job processes must inherit the launcher's standard streams.",
+                nameof(startInfo));
+        }
+
+        string commandLine = BuildCommandLine(startInfo);
+
+        // CreateProcessW may write to lpCommandLine, so it needs a writable,
+        // null-terminated buffer rather than a marshalled immutable string.
+        // The array is one element longer than the command line, and the extra
+        // trailing element is already '\0'. The buffer is never read back.
+        char[] commandLineBuffer = new char[commandLine.Length + 1];
+        commandLine.CopyTo(0, commandLineBuffer, 0, commandLine.Length);
+
+        using SafeFileHandle? inputCopy = DuplicateForChild(input, StandardInputHandle);
+        using SafeFileHandle? outputCopy = DuplicateForChild(output, StandardOutputHandle);
+        using SafeFileHandle? errorCopy = DuplicateForChild(standardError, StandardErrorHandle);
+        using var handles = new InheritedHandles(
+            [inputCopy?.DangerousGetHandle() ?? 0, outputCopy?.DangerousGetHandle() ?? 0, errorCopy?.DangerousGetHandle() ?? 0]);
+        IntPtr environment = BuildEnvironmentBlock(startInfo);
+        var startupInfo = new ExtendedStartupInfo
+        {
+            Startup = new StartupInfo
+            {
+                Size = handles.Attributes != 0 ? Marshal.SizeOf<ExtendedStartupInfo>() : Marshal.SizeOf<StartupInfo>(),
+                Flags = StartfUseStdHandles,
+                StandardInput = inputCopy?.DangerousGetHandle() ?? 0,
+                StandardOutput = outputCopy?.DangerousGetHandle() ?? 0,
+                StandardError = errorCopy?.DangerousGetHandle() ?? 0
+            },
+            Attributes = handles.Attributes
+        };
+
+        try
+        {
+            if (!CreateProcessW(
+                    startInfo.FileName,
+                    commandLineBuffer,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    inheritHandles: handles.Attributes != 0,
+                    CreateSuspended | CreateUnicodeEnvironment |
+                    (handles.Attributes != 0 ? 0x00080000u : 0u) |
+                    (startInfo.CreateNoWindow ? 0x08000000u : 0u),
+                    environment,
+                    string.IsNullOrWhiteSpace(startInfo.WorkingDirectory)
+                        ? null
+                        : startInfo.WorkingDirectory,
+                    ref startupInfo,
+                    out ProcessInformation processInformation))
+            {
+                throw new Win32Exception(
+                    Marshal.GetLastWin32Error(),
+                    "Unable to start the OpenClaw process.");
+            }
+
+            try
+            {
+                if (assignToJob &&
+                    !AssignProcessToJobObject(
+                        _handle,
+                        processInformation.Process))
+                {
+                    int error = Marshal.GetLastWin32Error();
+                    TerminateProcess(processInformation.Process, 1);
+                    throw new Win32Exception(
+                        error,
+                        "Unable to assign OpenClaw to its process job.");
+                }
+
+                Process process = Process.GetProcessById(
+                    unchecked((int)processInformation.ProcessId));
+                _ = process.SafeHandle;
+                if (ResumeThread(processInformation.Thread) == uint.MaxValue)
+                {
+                    int error = Marshal.GetLastWin32Error();
+                    process.Dispose();
+                    throw new Win32Exception(
+                        error,
+                        "Unable to resume the OpenClaw process.");
+                }
+
+                return process;
+            }
+            finally
+            {
+                CloseHandle(processInformation.Thread);
+                CloseHandle(processInformation.Process);
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(environment);
+        }
+    }
+
+    public void Dispose() => _handle.Dispose();
+
+    private static SafeFileHandle? DuplicateForChild(SafeHandle? handle, int standardHandle)
+    {
+        using var borrowed = new SafeFileHandle(GetStdHandle(standardHandle), ownsHandle: false);
+        SafeHandle source = handle ?? borrowed;
+        if (source.IsInvalid)
+        {
+            return null;
+        }
+        if (!DuplicateHandle(new IntPtr(-1), source, new IntPtr(-1), out SafeFileHandle copy, 0, true, 2))
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to duplicate the child's stream handle.");
+        }
+        return copy;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DuplicateHandle(
+        IntPtr sourceProcess, SafeHandle source, IntPtr targetProcess,
+        out SafeFileHandle target, uint access, [MarshalAs(UnmanagedType.Bool)] bool inherit, uint options);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ExtendedStartupInfo
+    {
+        public StartupInfo Startup;
+        public IntPtr Attributes;
+    }
+
+    private sealed class InheritedHandles : IDisposable
+    {
+        private IntPtr _values;
+        public IntPtr Attributes { get; private set; }
+
+        public InheritedHandles(IntPtr[] handles)
+        {
+            IntPtr[] valid = [.. handles.Where(handle => handle != 0 && handle != new IntPtr(-1)).Distinct()];
+            if (valid.Length == 0)
+            {
+                return;
+            }
+            nuint size = 0;
+            InitializeProcThreadAttributeList(0, 1, 0, ref size);
+            if (size == 0)
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            IntPtr attributes = Marshal.AllocHGlobal(checked((nint)size));
+            if (!InitializeProcThreadAttributeList(attributes, 1, 0, ref size))
+            {
+                int error = Marshal.GetLastWin32Error();
+                Marshal.FreeHGlobal(attributes);
+                throw new Win32Exception(error);
+            }
+            Attributes = attributes;
+            try
+            {
+                _values = Marshal.AllocHGlobal(valid.Length * IntPtr.Size);
+                Marshal.Copy(valid, 0, _values, valid.Length);
+                // Restrict inheritance to this launch's stdio. Otherwise a
+                // concurrent child can inherit another gateway's log/pipe.
+                if (!UpdateProcThreadAttribute(Attributes, 0, 0x00020002, _values,
+                    (nuint)(valid.Length * IntPtr.Size), 0, 0))
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+            }
+            catch
+            {
+                Dispose();
+                throw;
+            }
+        }
+
+        public void Dispose()
+        {
+            if (Attributes != 0)
+            {
+                DeleteProcThreadAttributeList(Attributes);
+                Marshal.FreeHGlobal(Attributes);
+                Attributes = 0;
+            }
+            Marshal.FreeHGlobal(_values);
+            _values = 0;
+        }
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool InitializeProcThreadAttributeList(IntPtr list, int count, uint flags, ref nuint size);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool UpdateProcThreadAttribute(
+        IntPtr list, uint flags, nuint attribute, IntPtr value, nuint size, IntPtr previous, IntPtr returnedSize);
+
+    [DllImport("kernel32.dll")]
+    private static extern void DeleteProcThreadAttributeList(IntPtr list);
+
+    private static string BuildCommandLine(ProcessStartInfo startInfo)
+    {
+        var commandLine = new StringBuilder();
+        AppendArgument(commandLine, startInfo.FileName);
+        foreach (string argument in startInfo.ArgumentList)
+        {
+            commandLine.Append(' ');
+            AppendArgument(commandLine, argument);
+        }
+
+        return commandLine.ToString();
+    }
+
+    private static void AppendArgument(StringBuilder commandLine, string argument)
+    {
+        // Match ProcessStartInfo.ArgumentList: quoting tokens that do not need
+        // it can change the behavior of executables with non-CRT parsers.
+        if (argument.Length > 0 && argument.AsSpan().IndexOfAny(QuoteCharacters) < 0)
+        {
+            commandLine.Append(argument);
+            return;
+        }
+        commandLine.Append('"');
+        int backslashes = 0;
+        foreach (char character in argument)
+        {
+            if (character == '\\')
+            {
+                backslashes++;
+                continue;
+            }
+
+            if (character == '"')
+            {
+                commandLine.Append('\\', (backslashes * 2) + 1);
+                commandLine.Append('"');
+                backslashes = 0;
+                continue;
+            }
+
+            commandLine.Append('\\', backslashes);
+            backslashes = 0;
+            commandLine.Append(character);
+        }
+
+        commandLine.Append('\\', backslashes * 2);
+        commandLine.Append('"');
+    }
+
+    private static IntPtr BuildEnvironmentBlock(ProcessStartInfo startInfo)
+    {
+        var environment = new SortedDictionary<string, string>(
+            StringComparer.OrdinalIgnoreCase);
+        foreach (System.Collections.DictionaryEntry variable in
+                 Environment.GetEnvironmentVariables())
+        {
+            environment[(string)variable.Key] = (string?)variable.Value ?? "";
+        }
+
+        foreach ((string key, string? value) in startInfo.Environment)
+        {
+            if (value is null)
+            {
+                environment.Remove(key);
+            }
+            else
+            {
+                environment[key] = value;
+            }
+        }
+
+        string block = string.Join(
+            '\0',
+            environment.Select(pair => $"{pair.Key}={pair.Value}")) + "\0\0";
+        return Marshal.StringToHGlobalUni(block);
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeJobHandle CreateJobObjectW(
+        IntPtr jobAttributes,
+        string? name);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetInformationJobObject(
+        SafeJobHandle job,
+        int informationClass,
+        IntPtr information,
+        uint informationLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AssignProcessToJobObject(
+        SafeJobHandle job,
+        IntPtr process);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CreateProcessW(
+        string applicationName,
+        char[] commandLine,
+        IntPtr processAttributes,
+        IntPtr threadAttributes,
+        [MarshalAs(UnmanagedType.Bool)] bool inheritHandles,
+        uint creationFlags,
+        IntPtr environment,
+        string? currentDirectory,
+        ref ExtendedStartupInfo startupInfo,
+        out ProcessInformation processInformation);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint ResumeThread(IntPtr thread);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GetStdHandle(int standardHandle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool TerminateProcess(IntPtr process, uint exitCode);
+
+    [DllImport("kernel32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JobObjectBasicLimitInformation
+    {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IoCounters
+    {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JobObjectExtendedLimitInformation
+    {
+        public JobObjectBasicLimitInformation BasicLimitInformation;
+        public IoCounters IoInfo;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed;
+        public UIntPtr PeakJobMemoryUsed;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct StartupInfo
+    {
+        public int Size;
+        public string? Reserved;
+        public string? Desktop;
+        public string? Title;
+        public uint X;
+        public uint Y;
+        public uint XSize;
+        public uint YSize;
+        public uint XCountChars;
+        public uint YCountChars;
+        public uint FillAttribute;
+        public uint Flags;
+        public ushort ShowWindow;
+        public ushort Reserved2Size;
+        public IntPtr Reserved2;
+        public IntPtr StandardInput;
+        public IntPtr StandardOutput;
+        public IntPtr StandardError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ProcessInformation
+    {
+        public IntPtr Process;
+        public IntPtr Thread;
+        public uint ProcessId;
+        public uint ThreadId;
+    }
+
+    private sealed class SafeJobHandle : SafeHandleZeroOrMinusOneIsInvalid
+    {
+        private SafeJobHandle()
+            : base(ownsHandle: true)
+        {
+        }
+
+        protected override bool ReleaseHandle() => CloseHandle(handle);
+    }
+}
