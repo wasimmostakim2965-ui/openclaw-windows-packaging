@@ -52,8 +52,8 @@ function Get-OpenClawPolicyRef {
 
     $repository = Get-OpenClawSourceField $Policy 'repository'
     Assert-OpenClawSourceText $repository 'repository'
-    if ($repository -cne 'https://github.com/openclaw/openclaw') {
-        throw 'The release policy repository must be https://github.com/openclaw/openclaw.'
+    if ($repository -cne 'https://github.com/wasimmostakim2965-ui/Open-Wai') {
+        throw 'The release policy repository must be https://github.com/wasimmostakim2965-ui/Open-Wai.'
     }
     $channel = Get-OpenClawSourceField $Policy 'channel' -Optional
     if ($null -ne $channel -and ($channel -isnot [string] -or $channel -cne 'stable')) {
@@ -94,7 +94,7 @@ function Invoke-OpenClawSourceRequest {
     if ($PSVersionTable.PSVersion -ge [version]'7.4') { $options.OperationTimeoutSeconds = 30 }
     $headers = @{ Accept = 'application/json' }
     if ($Service -eq 'GitHub') {
-        $origin = 'https://api.github.com/repos/openclaw/openclaw/'
+        $origin = 'https://api.github.com/repos/wasimmostakim2965-ui/Open-Wai/'
         $headers.Accept = 'application/vnd.github+json'
         $headers['User-Agent'] = 'OpenClaw-Gateway-MSIX'
         $headers['X-GitHub-Api-Version'] = '2022-11-28'
@@ -168,7 +168,7 @@ function Resolve-OpenClawSource {
         if ($repository -isnot [string]) { $repository = Get-OpenClawSourceField $repository 'url' }
         Assert-OpenClawSourceText $repository 'registry repository'
         if ($repository -cnotin @(
-                'https://github.com/openclaw/openclaw', 'git+https://github.com/openclaw/openclaw.git')) {
+                'https://github.com/wasimmostakim2965-ui/Open-Wai', 'git+https://github.com/wasimmostakim2965-ui/Open-Wai.git')) {
             throw 'The registry package repository does not match the release policy.'
         }
         $integrity = $manifest.dist.integrity

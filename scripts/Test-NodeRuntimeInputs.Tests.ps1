@@ -70,7 +70,7 @@ require("node:fs").writeFileSync("installed-architecture.txt", process.arch);
     }
     $otherArchitecture = if ($nodeArchitecture -eq 'x64') { 'arm64' } else { 'x64' }
     $sourceMetadata = @{
-        repository = 'https://github.com/openclaw/openclaw'
+        repository = 'https://github.com/wasimmostakim2965-ui/Open-Wai'
         requestedRef = '1' * 40
         resolvedCommit = '1' * 40
         packageVersion = '0.0.0'

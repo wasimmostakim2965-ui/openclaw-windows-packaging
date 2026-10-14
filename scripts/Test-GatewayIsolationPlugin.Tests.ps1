@@ -162,7 +162,7 @@ try {
     }
 
     [ordered]@{
-        repository = 'https://github.com/openclaw/openclaw'
+        repository = 'https://github.com/wasimmostakim2965-ui/Open-Wai'
         requestedRef = '0965053fe6b9341776df147a6934b7485c60b5ca'
         resolvedCommit = '0965053fe6b9341776df147a6934b7485c60b5ca'
         packageVersion = '2026.8.2'

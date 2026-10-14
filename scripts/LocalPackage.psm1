@@ -843,7 +843,7 @@ function Get-LocalPackageOperations {
         }
         LatestRun = {
             $gh = Get-LocalPackageGitHubCommand
-            $lines = @(& $gh.Source run list --repo openclaw/openclaw-windows-packaging `
+            $lines = @(& $gh.Source run list --repo wasimmostakim2965-ui/openclaw-windows-packaging `
                 --workflow gateway-msix.yml --branch main --status success --limit 1 --json databaseId)
             if ($LASTEXITCODE -ne 0) {
                 throw "Unable to query the payload workflow (exit $LASTEXITCODE). Check gh authentication, or pass -PayloadDirectory."
@@ -857,7 +857,7 @@ function Get-LocalPackageOperations {
         Download = {
             param($runId, $architecture, $directory)
             $gh = Get-LocalPackageGitHubCommand
-            & $gh.Source run download $runId --repo openclaw/openclaw-windows-packaging `
+            & $gh.Source run download $runId --repo wasimmostakim2965-ui/openclaw-windows-packaging `
                 --name "openclaw-gateway-payload-$architecture" --dir $directory |
                 ForEach-Object { Write-Host $_ }
             if ($LASTEXITCODE -ne 0) {

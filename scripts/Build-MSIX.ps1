@@ -394,7 +394,7 @@ if (-not (Test-Path -LiteralPath $payloadMetadata -PathType Leaf)) {
 
 $payloadInfo = Get-Content -LiteralPath $payloadMetadata -Raw | ConvertFrom-Json
 if (
-    $payloadInfo.repository -ne 'https://github.com/openclaw/openclaw' -or
+    $payloadInfo.repository -ne 'https://github.com/wasimmostakim2965-ui/Open-Wai' -or
     $payloadInfo.architecture -ne $Architecture -or
     $payloadInfo.layout -ne 'expanded-directory' -or
     $payloadInfo.nodeVersion -isnot [string] -or
@@ -851,7 +851,7 @@ try {
         Get-FileHash -LiteralPath $msixPath -Algorithm SHA256
     ).Hash.ToLowerInvariant()
     [ordered]@{
-        packagingRepository = 'https://github.com/openclaw/openclaw-windows-packaging'
+        packagingRepository = 'https://github.com/wasimmostakim2965-ui/openclaw-windows-packaging'
         packagingCommit = $SourceCommit.ToLowerInvariant()
         sourceTreeDirty = $SourceTreeDirty.IsPresent
         payloadRepository = $payloadInfo.repository

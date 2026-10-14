@@ -44,7 +44,7 @@ try {
         Get-FileHash -LiteralPath $packagePath -Algorithm SHA256
     ).Hash.ToLowerInvariant()
     [ordered]@{
-        repository = 'https://github.com/openclaw/openclaw'
+        repository = 'https://github.com/wasimmostakim2965-ui/Open-Wai'
         requestedRef = 'old-ref'
         resolvedCommit = $commit
         packageVersion = '1.2.3'

@@ -424,7 +424,7 @@ jobs:
         if: ${{ steps.package-cache.outputs.cache-hit != 'true' }}
         uses: actions/checkout@v7
         with:
-          repository: openclaw/openclaw
+          repository: wasimmostakim2965-ui/Open-Wai
           ref: ${{ steps.resolve.outputs.sha }}
           persist-credentials: false
           fetch-depth: 1
@@ -468,7 +468,7 @@ jobs:
 
           cat > "${artifact_dir}/source.json" <<EOF
           {
-            "repository": "https://github.com/openclaw/openclaw",
+            "repository": "https://github.com/wasimmostakim2965-ui/Open-Wai",
             "requestedRef": "${OPENCLAW_REF}",
             "resolvedCommit": "${source_sha}",
             "packageVersion": "${package_version}",
@@ -1272,7 +1272,7 @@ jobs:
             release-assets/*.msixbundle
           body: |
             Packages OpenClaw `${{ needs.build-package.outputs.package_version }}`
-            from [`openclaw/openclaw@${{ needs.build-package.outputs.source_sha }}`](https://github.com/openclaw/openclaw/commit/${{ needs.build-package.outputs.source_sha }}).
+            from [`wasimmostakim2965-ui/Open-Wai@${{ needs.build-package.outputs.source_sha }}`](https://github.com/wasimmostakim2965-ui/Open-Wai/commit/${{ needs.build-package.outputs.source_sha }}).
 
             ### Downloads
             - **Recommended:** `OpenClawGateway-${{ needs.authorize-signing.outputs.release_version }}.msixbundle`

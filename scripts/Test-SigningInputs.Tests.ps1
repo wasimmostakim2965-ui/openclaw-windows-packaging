@@ -303,7 +303,7 @@ function New-TestArtifact {
     ).Hash.ToLowerInvariant()
     [ordered]@{
         packagingRepository =
-            'https://github.com/openclaw/openclaw-windows-packaging'
+            'https://github.com/wasimmostakim2965-ui/openclaw-windows-packaging'
         packagingCommit = $packagingCommit
         sourceTreeDirty = $SourceTreeDirty
         payloadRepository = $policy.repository

@@ -26,7 +26,7 @@ if (!metadataEntry.isFile()) {
   throw new Error("Payload metadata must be a regular file, not a symbolic link.");
 }
 const payload = JSON.parse(await fs.readFile(metadataPath, "utf8"));
-assert.equal(payload.repository, "https://github.com/openclaw/openclaw");
+assert.equal(payload.repository, "https://github.com/wasimmostakim2965-ui/Open-Wai");
 assert.match(payload.resolvedCommit, /^[0-9a-f]{40}$/);
 assert.match(payload.packageVersion, /^\d{4}\.\d+\.\d+(?:-\d+)?$/);
 const identity = JSON.parse(await fs.readFile(

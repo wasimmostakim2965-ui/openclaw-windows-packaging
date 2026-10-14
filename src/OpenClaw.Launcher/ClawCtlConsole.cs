@@ -13,7 +13,7 @@ internal static class ClawCtlConsole
     private const string IdentityMark = "\U0001f980";
 
     private const string IssueUrl =
-        "https://github.com/openclaw/openclaw-windows-packaging/issues";
+        "https://github.com/wasimmostakim2965-ui/openclaw-windows-packaging/issues";
 
     // Colour is an event, not a wash. Labels stay in the terminal's own
     // foreground -- which is by definition legible on the user's background --

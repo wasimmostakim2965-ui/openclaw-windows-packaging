@@ -25,8 +25,8 @@ $originalToken = $env:GH_TOKEN
 # Mock the native transport, which survives the workflow script dot-sourcing the helper again.
 ${function:Invoke-RestMethod} = {
     param($Uri, $Headers, $TimeoutSec, $OperationTimeoutSeconds, $MaximumRedirection, $ErrorAction)
-    $key = if ($Uri.StartsWith('https://api.github.com/repos/openclaw/openclaw/', [StringComparison]::Ordinal)) {
-        'GitHub:' + $Uri.Substring('https://api.github.com/repos/openclaw/openclaw/'.Length)
+    $key = if ($Uri.StartsWith('https://api.github.com/repos/wasimmostakim2965-ui/Open-Wai/', [StringComparison]::Ordinal)) {
+        'GitHub:' + $Uri.Substring('https://api.github.com/repos/wasimmostakim2965-ui/Open-Wai/'.Length)
     }
     elseif ($Uri.StartsWith('https://registry.npmjs.org/openclaw/', [StringComparison]::Ordinal)) {
         'Registry:' + $Uri.Substring('https://registry.npmjs.org/openclaw/'.Length)
@@ -69,7 +69,7 @@ function Add-Release {
     param([string]$Version = $script:version, [string]$Commit = $script:commit, [string]$Tag = $script:tagObject)
     $http.Responses["Registry:$Version"] = [pscustomobject]@{
         name = 'openclaw'; version = $Version; gitHead = $Commit
-        repository = [pscustomobject]@{ type = 'git'; url = 'git+https://github.com/openclaw/openclaw.git' }
+        repository = [pscustomobject]@{ type = 'git'; url = 'git+https://github.com/wasimmostakim2965-ui/Open-Wai.git' }
         dist = [pscustomobject]@{ integrity = $script:integrity; tarball = 'https://untrusted.invalid/never-follow' }
     }
     $http.Responses["GitHub:git/ref/tags/v$Version"] = [pscustomobject]@{

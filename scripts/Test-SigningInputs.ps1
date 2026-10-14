@@ -167,7 +167,7 @@ $policy = Get-Content -LiteralPath $resolvedPolicyPath -Raw |
     ConvertFrom-Json
 
 if (
-    $policy.repository -ne 'https://github.com/openclaw/openclaw' -or
+    $policy.repository -ne 'https://github.com/wasimmostakim2965-ui/Open-Wai' -or
     $policy.msixRevision -isnot [int64] -or
     [string]::IsNullOrWhiteSpace([string]$policy.packageIdentityName) -or
     [string]::IsNullOrWhiteSpace([string]$policy.packageFamilyName) -or
@@ -237,7 +237,7 @@ foreach ($architecture in @('x64', 'arm64')) {
     $msix = $msixFiles[0]
     if (
         $metadata.packagingRepository -ne
-            'https://github.com/openclaw/openclaw-windows-packaging' -or
+            'https://github.com/wasimmostakim2965-ui/openclaw-windows-packaging' -or
         $metadata.packagingCommit -ine $expectedPackagingCommit -or
         $metadata.sourceTreeDirty -ne $false -or
         $metadata.payloadRepository -ne $policy.repository -or
