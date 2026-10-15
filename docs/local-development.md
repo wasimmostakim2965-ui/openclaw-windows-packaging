@@ -328,8 +328,8 @@ that directory, restoring the caller's directory even when validation fails.
 
 The plugin-owned `windows-agent-handoff` skill uses OpenClaw's manifest `skills`
 facility, not Copilot's repository skill directories. Author it using upstream's
-[skill-creator workflow](https://github.com/openclaw/openclaw/blob/3a9d69db306cd7f081e06254cb89c4bcc14a7107/skills/skill-creator/SKILL.md)
-and [creating-skills guidance](https://github.com/openclaw/openclaw/blob/3a9d69db306cd7f081e06254cb89c4bcc14a7107/docs/tools/creating-skills.md):
+[skill-creator workflow](https://github.com/wasimmostakim2965-ui/Open-Wai/blob/3a9d69db306cd7f081e06254cb89c4bcc14a7107/skills/skill-creator/SKILL.md)
+and [creating-skills guidance](https://github.com/wasimmostakim2965-ui/Open-Wai/blob/3a9d69db306cd7f081e06254cb89c4bcc14a7107/docs/tools/creating-skills.md):
 keep the description selective, one line, and under 160 characters; keep shared
 workflow, safety boundaries, GUI/authentication, and all file-handoff routes in
 one self-contained `SKILL.md`; verify discovery and its complete on-demand read.

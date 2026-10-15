@@ -5,14 +5,14 @@ This repository builds a Windows MSIX package containing:
 - one .NET 10 NativeAOT launcher exposed through separate packaged
   `openclaw` and `clawctl` application identities and app execution aliases;
 - a pinned, verified build of
-  [`openclaw/openclaw`](https://github.com/openclaw/openclaw);
+  [`wasimmostakim2965-ui/Open-Wai`](https://github.com/wasimmostakim2965-ui/Open-Wai);
 - the official Node.js archive matching the upstream build's runtime version
   and the package architecture.
 
 Builds use .NET SDK 10.0.400 or a later .NET 10 feature band.
 
 The package is independent from the
-[OpenClaw Windows Node and Companion](https://github.com/openclaw/openclaw-windows-node)
+[OpenClaw Windows Node and Companion](https://github.com/wasimmostakim2965-ui/openclaw-windows-node)
 and uses the Partner Center-reserved
 `OpenClawFoundation.OpenClawGateway` package identity. Its package family is
 `OpenClawFoundation.OpenClawGateway_rfcbke2p71se2` and its publisher is
@@ -561,7 +561,7 @@ Coverage and the local-only runtime proof are described in
 
 Full selected-theme cohesion requires the generic plugin-frame theme forwarding
 merged by
-[`openclaw/openclaw#145409`](https://github.com/openclaw/openclaw/pull/145409).
+[`wasimmostakim2965-ui/Open-Wai#145409`](https://github.com/wasimmostakim2965-ui/Open-Wai/pull/145409).
 OpenClaw `v2026.9.5` at `ec9c1a13db8938e5a3eaa51fca2e981cde2395a9`
 includes that forwarding and has been qualified with this default-on plugin.
 All build modes follow the stable-source selection above and validate plugin
@@ -795,7 +795,7 @@ federated identity credential with:
 
 This repository was created after GitHub's immutable OIDC subject rollout, so
 the subject includes the organization and repository IDs. The older mutable
-`repo:openclaw/openclaw-windows-packaging:...` form will not match its tokens.
+`repo:wasimmostakim2965-ui/openclaw-windows-packaging:...` form will not match its tokens.
 
 The service principal must have `Artifact Signing Certificate Profile Signer`
 on the `openclaw` certificate profile (or a containing scope). The workflow

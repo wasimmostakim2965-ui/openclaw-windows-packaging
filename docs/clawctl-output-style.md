@@ -82,7 +82,7 @@ capture diagnostics and where to report the problem:
 1. Run `clawctl collect-logs`.
 2. Review the resulting bundle before sharing it.
 3. File an issue at
-   <https://github.com/openclaw/openclaw-windows-packaging/issues>.
+   <https://github.com/wasimmostakim2965-ui/openclaw-windows-packaging/issues>.
 
 `clawctl collect-logs` is the user-facing diagnostics entry point. Other
 commands should not expose individual log paths when the bundle can collect the

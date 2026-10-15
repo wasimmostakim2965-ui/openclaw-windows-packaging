@@ -59,7 +59,7 @@ public sealed class ProgramStartupTests : IDisposable
         Assert.Equal(1, exitCode);
         Assert.Contains("clawctl collect-logs", error.ToString(), StringComparison.Ordinal);
         Assert.Contains(
-            "https://github.com/openclaw/openclaw-windows-packaging/issues",
+            "https://github.com/wasimmostakim2965-ui/openclaw-windows-packaging/issues",
             error.ToString(),
             StringComparison.Ordinal);
         Assert.DoesNotContain("package is ready", output.ToString(), StringComparison.Ordinal);

@@ -9,7 +9,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $IgnoredPathPrefixes = @(
-    # README.md references this action from the upstream openclaw/openclaw repository.
+    # README.md references this action from the upstream wasimmostakim2965-ui/Open-Wai repository.
     '.github/actions/'
 )
 
