@@ -28,7 +28,7 @@ internal static class SessionSupportPolicy
         "the latest Windows updates (Settings > Windows Update), or install a " +
         "newer Windows version, and run `clawctl setup` again. See the " +
         "requirements section of the OpenClaw Gateway MSIX README: " +
-        "https://github.com/wasimmostakim2965-ui/openclaw-windows-packaging#requirements";
+        "https://github.com/openclaw/openclaw-windows-packaging#requirements";
 
     /// <summary>
     /// Throws when this machine cannot host an isolated session.
